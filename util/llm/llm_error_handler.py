@@ -54,9 +54,9 @@ def should_fallback_to_original(error: Exception) -> bool:
     if isinstance(error, ConnectionErrorWrapper):
         return False
 
-    # API 响应错误：提示用户检查配置
+    # API 响应错误：降级到原文本（如模型输出解析失败等偶发问题）
     if isinstance(error, APIResponseErrorWrapper):
-        return False
+        return True
 
     # 超时和速率限制：可以降级到原文本
     if isinstance(error, (TimeoutErrorWrapper, RateLimitErrorWrapper)):
