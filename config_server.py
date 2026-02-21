@@ -13,7 +13,7 @@ class ServerConfig:
     addr = '0.0.0.0'
     port = '6016'
 
-    # 语音模型选择：'fun_asr_nano', 'sensevoice', 'paraformer'
+    # 语音模型选择：'fun_asr_nano', 'sensevoice', 'paraformer', 'online_aliyun'
     model_type = 'fun_asr_nano'
 
     format_num = True       # 输出时是否将中文数字转为阿拉伯数字
@@ -112,4 +112,10 @@ class FunASRNanoGGUFArgs:
     similar_threshold = 0.6     # 热词相似度阈值
     max_hotwords = 20           # 每次替换的最大热词数
     verbose = False
+
+
+class AliyunASRConfig:
+    """阿里云 DashScope 语音识别配置"""
+    api_key = ''                        # DashScope API Key，也可通过环境变量 DASHSCOPE_API_KEY 设置
+    model = 'paraformer-realtime-v2'    # 可选: 'paraformer-realtime-v2', 'fun-asr-realtime'
 

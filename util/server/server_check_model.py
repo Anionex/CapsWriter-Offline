@@ -28,6 +28,12 @@ def check_model() -> None:
     model_type = Config.model_type.lower()
     logger.debug(f"检查模型文件, 类型: {model_type}")
 
+    # 在线模式无需本地模型文件
+    if model_type.startswith('online_'):
+        logger.info(f"在线模式 ({model_type})，跳过模型文件检查")
+        console.print(f'[green4]在线模式 ({model_type})，跳过模型文件检查', end='\n\n')
+        return
+
     # 根据模型类型确定需要检查的文件
     if model_type == 'fun_asr_nano':
         required_files = {
@@ -65,6 +71,7 @@ def check_model() -> None:
     - 'fun_asr_nano'
     - 'sensevoice'
     - 'paraformer'
+    - 'online_aliyun'
 
         ''', style='bright_red')
         input('按回车退出')
