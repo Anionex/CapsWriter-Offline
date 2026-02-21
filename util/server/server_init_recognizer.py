@@ -63,15 +63,17 @@ def init_recognizer(queue_in: Queue, queue_out: Queue, sockets_id, stdin_fn):
     # 注册 atexit 处理器
     atexit.register(cleanup_recognizer_resources)
 
-    # 导入模块
-    with console.status("载入模块中…", spinner="bouncingBall", spinner_style="yellow"):
-        import sherpa_onnx
-    console.print('[green4]模块加载完成', end='\n\n')
-    logger.info("Sherpa-ONNX 模块加载完成")
+    model_type = Config.model_type.lower()
 
-    # 载入语音模型
-    console.print('[yellow]语音模型载入中', end='\r'); t1 = time.time()
-    logger.info(f"开始加载语音模型，类型: {Config.model_type}")
+    # 在线模式跳过本地模块加载
+    if model_type.startswith('online_'):
+        logger.info(f"在线模式 ({model_type})，跳过本地模块加载")
+    else:
+        # 导入模块
+        with console.status("载入模块中…", spinner="bouncingBall", spinner_style="yellow"):
+            import sherpa_onnx
+        console.print('[green4]模块加载完成', end='\n\n')
+        logger.info("Sherpa-ONNX 模块加载完成")
 
     # 载入语音模型
     console.print('[yellow]语音模型载入中', end='\r'); t1 = time.time()
@@ -80,9 +82,12 @@ def init_recognizer(queue_in: Queue, queue_out: Queue, sockets_id, stdin_fn):
 
 
     # 根据配置选择模型类型
-    model_type = Config.model_type.lower()
     try:
-        if model_type == 'fun_asr_nano':
+        if model_type == 'online_aliyun':
+            from util.server.online_recognizer_aliyun import AliyunRecognizer
+            recognizer = AliyunRecognizer()
+            logger.debug("使用阿里云 DashScope 在线识别")
+        elif model_type == 'fun_asr_nano':
             logger.debug("使用 Fun-ASR-Nano 模型")
             # recognizer = sherpa_onnx.OfflineRecognizer.from_funasr_nano(
             #     **{key: value for key, value in FunASRNanoArgs.__dict__.items() if not key.startswith('_')}
@@ -101,7 +106,7 @@ def init_recognizer(queue_in: Queue, queue_out: Queue, sockets_id, stdin_fn):
                 **{key: value for key, value in ParaformerArgs.__dict__.items() if not key.startswith('_')}
             )
         else:
-            error_msg = f"不支持的模型类型: {Config.model_type}，请选择 'fun_asr_nano'、'sensevoice' 或 'paraformer'"
+            error_msg = f"不支持的模型类型: {Config.model_type}，请选择 'fun_asr_nano'、'sensevoice'、'paraformer' 或 'online_aliyun'"
             logger.error(error_msg)
             raise ValueError(error_msg)
     except Exception as e:
