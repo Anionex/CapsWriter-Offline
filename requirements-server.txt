@@ -10,6 +10,9 @@ websockets
 watchdog
 pypinyin
 
+# online ASR (Qwen3-ASR WebSocket)
+websocket-client
+
 # tray and image
 pystray
 Pillow

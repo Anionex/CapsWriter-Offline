@@ -14,7 +14,7 @@ class ServerConfig:
     port = '6016'
 
     # 语音模型选择：'fun_asr_nano', 'sensevoice', 'paraformer', 'online_aliyun'
-    model_type = 'fun_asr_nano'
+    model_type = 'online_aliyun'
 
     format_num = True       # 输出时是否将中文数字转为阿拉伯数字
     format_spell = True     # 输出时是否调整中英之间的空格
@@ -115,7 +115,10 @@ class FunASRNanoGGUFArgs:
 
 
 class AliyunASRConfig:
-    """阿里云 DashScope 语音识别配置"""
-    api_key = ''                        # DashScope API Key，也可通过环境变量 DASHSCOPE_API_KEY 设置
-    model = 'paraformer-realtime-v2'    # 可选: 'paraformer-realtime-v2', 'fun-asr-realtime'
+    """阿里云 DashScope 语音识别配置（Qwen3-ASR Realtime WebSocket）"""
+    api_key = 'sk-4a251448562b42df968e72cee50bff11'  # DashScope API Key，也可通过环境变量 DASHSCOPE_API_KEY 设置
+    model = 'qwen3-asr-flash-realtime-2026-02-10'    # Qwen3-ASR 实时模型
+    language = 'zh'               # 语言代码
+    enable_itn = False            # 是否启用逆文本正则化（数字转换等）
+    context = ''                  # 语境提示文本，可填入专业术语辅助识别
 

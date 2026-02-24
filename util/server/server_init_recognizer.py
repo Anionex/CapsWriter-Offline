@@ -6,11 +6,9 @@ import signal
 import atexit
 from platform import system
 from config_server import ServerConfig as Config
-from config_server import ParaformerArgs, ModelPaths, SenseVoiceArgs, FunASRNanoGGUFArgs
 from util.server.server_check_model import check_model
 from util.server.server_cosmic import console
 from util.server.server_recognize import recognize
-from util.fun_asr_gguf import create_asr_engine
 
 from . import logger
 
@@ -88,19 +86,20 @@ def init_recognizer(queue_in: Queue, queue_out: Queue, sockets_id, stdin_fn):
             recognizer = AliyunRecognizer()
             logger.debug("使用阿里云 DashScope 在线识别")
         elif model_type == 'fun_asr_nano':
+            from config_server import FunASRNanoGGUFArgs
+            from util.fun_asr_gguf import create_asr_engine
             logger.debug("使用 Fun-ASR-Nano 模型")
-            # recognizer = sherpa_onnx.OfflineRecognizer.from_funasr_nano(
-            #     **{key: value for key, value in FunASRNanoArgs.__dict__.items() if not key.startswith('_')}
-            # )
             recognizer = create_asr_engine(
                 **{key: value for key, value in FunASRNanoGGUFArgs.__dict__.items() if not key.startswith('_')}
             )
         elif model_type == 'sensevoice':
+            from config_server import SenseVoiceArgs
             logger.debug("使用 SenseVoice 模型")
             recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
                 **{key: value for key, value in SenseVoiceArgs.__dict__.items() if not key.startswith('_')}
             )
         elif model_type == 'paraformer':
+            from config_server import ParaformerArgs
             logger.debug("使用 Paraformer 模型")
             recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
                 **{key: value for key, value in ParaformerArgs.__dict__.items() if not key.startswith('_')}
@@ -119,6 +118,7 @@ def init_recognizer(queue_in: Queue, queue_out: Queue, sockets_id, stdin_fn):
     # 载入标点模型（仅 Paraformer 需要）
     punc_model = None
     if model_type == 'paraformer':
+        from config_server import ModelPaths
         logger.info("开始加载标点模型")
         console.print('[yellow]标点模型载入中', end='\r')
         config = sherpa_onnx.OfflinePunctuationConfig(

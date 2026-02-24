@@ -1,22 +1,28 @@
 # coding: utf-8
 """
-阿里云 DashScope 在线语音识别器
+阿里云 DashScope 在线语音识别器（Qwen3-ASR Realtime WebSocket）
 
 实现与 FunASREngine / sherpa-onnx 相同的接口（create_stream / decode_stream），
-内部调用 DashScope SDK 进行语音识别。
+内部通过 WebSocket 协议调用 Qwen3-ASR 实时模型。
 """
 
+import base64
+import json
 import logging
 import os
-import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
+import websocket
 
 from config_server import AliyunASRConfig
 
 logger = logging.getLogger(__name__)
+
+WS_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime'
+AUDIO_CHUNK_SIZE = 8000  # 每次发送的 int16 采样数（约 0.5s @16kHz）
 
 
 @dataclass
@@ -47,78 +53,51 @@ class RecognitionStream:
 
 
 class AliyunRecognizer:
-    """阿里云 DashScope 在线语音识别器，接口兼容 sherpa-onnx / FunASREngine"""
+    """阿里云 DashScope 在线语音识别器（Qwen3-ASR Realtime WebSocket），接口兼容 sherpa-onnx / FunASREngine"""
 
     def __init__(self):
         self.sample_rate = 16000
         cfg = AliyunASRConfig
         self._model = cfg.model
-
-        # 设置 API Key
-        import dashscope
-        if cfg.api_key:
-            dashscope.api_key = cfg.api_key
-        elif 'DASHSCOPE_API_KEY' not in os.environ:
+        self._language = cfg.language
+        self._enable_itn = cfg.enable_itn
+        self._context = cfg.context
+        self._api_key = cfg.api_key or os.environ.get('DASHSCOPE_API_KEY', '')
+        if not self._api_key:
             logger.warning("未设置 DashScope API Key，请在 config_server.py 或环境变量中配置")
 
     def create_stream(self, **kwargs):
         return RecognitionStream(sample_rate=self.sample_rate)
 
+    def _build_ws_url(self):
+        return f"{WS_URL}?model={self._model}"
+
+    def _make_event(self, event_type: str, **kwargs):
+        """构造 WebSocket 事件消息"""
+        msg = {"event_id": uuid.uuid4().hex, "type": event_type}
+        msg.update(kwargs)
+        return json.dumps(msg, ensure_ascii=False)
+
     def decode_stream(self, stream: RecognitionStream, context=None, **kwargs):
-        """调用 DashScope API 识别音频"""
+        """通过 WebSocket 实时接口调用 Qwen3-ASR 识别音频"""
         audio = stream.audio_data
         if audio is None:
             stream.set_result("")
             return
 
-        from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult as DashResult
+        # float32 → int16 PCM
+        pcm_int16 = np.clip(audio * 32768, -32768, 32767).astype(np.int16)
+        pcm_bytes = pcm_int16.tobytes()
 
-        # float32 → int16 PCM bytes
-        pcm = (audio * 32767).astype(np.int16).tobytes()
+        # 合并语境
+        ctx_parts = [self._context, context or ""]
+        ctx = " ".join(p for p in ctx_parts if p)
 
-        # 用于同步等待结果
-        collected_texts = []
-        done_event = threading.Event()
-        error_msg = [None]
-
-        class _Callback(RecognitionCallback):
-            def on_complete(self):
-                done_event.set()
-
-            def on_error(self, message):
-                error_msg[0] = str(message.message) if hasattr(message, 'message') else str(message)
-                logger.error(f"DashScope ASR 错误: {error_msg[0]}")
-                done_event.set()
-
-            def on_event(self, result: DashResult):
-                sentence = result.get_sentence()
-                if sentence and 'text' in sentence:
-                    if DashResult.is_sentence_end(sentence):
-                        collected_texts.append(sentence['text'])
-
-        callback = _Callback()
-        recognition = Recognition(
-            model=self._model,
-            format='pcm',
-            sample_rate=self.sample_rate,
-            semantic_punctuation_enabled=False,
-            callback=callback,
-        )
-
+        final_text = ""
         try:
-            recognition.start()
-
-            # 分块发送音频 (3200 bytes = 100ms of 16kHz 16-bit mono)
-            chunk_size = 3200
-            for i in range(0, len(pcm), chunk_size):
-                recognition.send_audio_frame(pcm[i:i + chunk_size])
-
-            recognition.stop()
-            done_event.wait(timeout=30)
+            final_text = self._ws_recognize(pcm_bytes, ctx)
         except Exception as e:
-            logger.error(f"DashScope ASR 调用失败: {e}", exc_info=True)
-
-        final_text = ''.join(collected_texts)
+            logger.error(f"Qwen3-ASR WebSocket 识别失败: {e}")
 
         # 生成字符级 tokens 和均匀时间戳
         chars = list(final_text.replace(' ', ''))
@@ -130,3 +109,80 @@ class AliyunRecognizer:
             timestamps = []
 
         stream.set_result(final_text, timestamps, chars)
+
+    def _ws_recognize(self, pcm_bytes: bytes, context: str) -> str:
+        """通过 WebSocket 完成一次完整的识别流程"""
+        ws = websocket.create_connection(
+            self._build_ws_url(),
+            header=[
+                f"Authorization: bearer {self._api_key}",
+                "X-DashScope-DataInspection: enable",
+            ],
+            timeout=30,
+        )
+        try:
+            return self._ws_session(ws, pcm_bytes, context)
+        finally:
+            ws.close()
+
+    def _ws_session(self, ws, pcm_bytes: bytes, context: str) -> str:
+        """WebSocket 会话：配置 → 发送音频 → 收集结果"""
+        # 1. 等待 session.created
+        self._recv_until(ws, 'session.created')
+
+        # 2. 发送 session.update（手动模式，不用 VAD）
+        session_cfg = {
+            "session": {
+                "modalities": ["audio", "text"],
+                "input_audio_format": "pcm",
+                "input_audio_sample_rate": self.sample_rate,
+                "turn_detection": None,
+                "input_audio_transcription": {
+                    "language": self._language,
+                    "enable_itn": self._enable_itn,
+                },
+            }
+        }
+        if context:
+            session_cfg["session"]["input_audio_transcription"]["context"] = context
+        ws.send(self._make_event("session.update", **session_cfg))
+        self._recv_until(ws, 'session.updated')
+
+        # 3. 分块发送音频
+        offset = 0
+        chunk_bytes = AUDIO_CHUNK_SIZE * 2  # int16 = 2 bytes per sample
+        while offset < len(pcm_bytes):
+            chunk = pcm_bytes[offset:offset + chunk_bytes]
+            b64 = base64.b64encode(chunk).decode('ascii')
+            ws.send(self._make_event("input_audio_buffer.append", audio=b64))
+            offset += chunk_bytes
+
+        # 4. commit + finish
+        ws.send(self._make_event("input_audio_buffer.commit"))
+        ws.send(self._make_event("session.finish"))
+
+        # 5. 收集识别结果
+        final_text = ""
+        while True:
+            data = json.loads(ws.recv())
+            evt = data.get("type", "")
+
+            if evt == "conversation.item.input_audio_transcription.completed":
+                final_text = data.get("transcript", "")
+            elif evt == "session.finished":
+                break
+            elif evt == "error":
+                logger.error(f"Qwen3-ASR 服务端错误: {data}")
+                break
+
+        return final_text
+
+    def _recv_until(self, ws, target_type: str):
+        """接收消息直到收到指定类型的事件"""
+        while True:
+            data = json.loads(ws.recv())
+            evt = data.get("type", "")
+            if evt == target_type:
+                return data
+            if evt == "error":
+                raise RuntimeError(f"Qwen3-ASR 服务端错误: {data}")
