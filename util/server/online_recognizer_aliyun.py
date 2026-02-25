@@ -6,19 +6,19 @@
 内部通过 WebSocket 协议调用 Qwen3-ASR 实时模型。
 
 流式策略：
-- 用户开始说话时立即建立 WebSocket 连接并配置 session
-- 每个音频片段到达时实时发送，API 同步处理
-- 松开按键时发送 commit+finish，此时大部分音频已处理完毕
-- 最终结果几乎立即返回，消除 ~2s 固定等待
+- 边录边传：用户开始说话时获取连接并实时发送音频
+- 预热连接：每次识别结束后立即在后台建立下一个连接
+- 松开按键时发送 commit+finish，大部分音频已处理完毕
+- 下次按键时直接使用预热连接，消除建连延迟
 """
 
 import asyncio
 import base64
 import concurrent.futures
 import json
-import logging
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -27,11 +27,11 @@ import numpy as np
 import websockets
 
 from config_server import AliyunASRConfig
-
-logger = logging.getLogger(__name__)
+from . import logger
 
 WS_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime'
 AUDIO_CHUNK_SIZE = 8000  # 每次发送的 int16 采样数（约 0.5s @16kHz）
+WARM_MAX_AGE = 55  # 预热连接最大存活秒数（超过则丢弃重建）
 
 
 @dataclass
@@ -83,10 +83,19 @@ class AliyunRecognizer:
 
         self._sessions: Dict[str, _SessionState] = {}
 
+        # 预热连接：识别结束后立即在后台建立下一个连接
+        self._warm_ws = None  # 预建立的 WebSocket（已完成 session 配置）
+        self._warm_context: str = ""  # 预热连接使用的 context
+        self._warm_time: float = 0  # 预热完成的时间戳（monotonic）
+
         # 持久事件循环，运行在独立线程，避免每次 asyncio.run() 的开销
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._loop_thread.start()
+
+        # 启动时立即预热第一个连接，消除首次识别的建连延迟
+        if self._api_key:
+            self._schedule_warm_up(self._context)
 
     def create_stream(self, **kwargs):
         return RecognitionStream(sample_rate=self.sample_rate)
@@ -98,6 +107,88 @@ class AliyunRecognizer:
         msg = {"event_id": uuid.uuid4().hex, "type": event_type}
         msg.update(kwargs)
         return json.dumps(msg, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    # 连接管理（预热策略）
+    # ------------------------------------------------------------------
+
+    def _build_session_cfg(self, context: str) -> dict:
+        """构建 session.update 的配置"""
+        cfg = {
+            "session": {
+                "modalities": ["audio", "text"],
+                "input_audio_format": "pcm",
+                "input_audio_sample_rate": self.sample_rate,
+                "turn_detection": None,
+                "input_audio_transcription": {
+                    "language": self._language,
+                    "enable_itn": self._enable_itn,
+                },
+            }
+        }
+        if context:
+            cfg["session"]["input_audio_transcription"]["context"] = context
+        return cfg
+
+    async def _create_configured_ws(self, context: str):
+        """创建并配置一个新的 WebSocket 连接（完成握手 + session 配置）"""
+        headers = {
+            "Authorization": f"bearer {self._api_key}",
+            "X-DashScope-DataInspection": "enable",
+        }
+        ws = await websockets.connect(
+            self._build_ws_url(), additional_headers=headers,
+        )
+        await self._recv_until(ws, 'session.created')
+        await ws.send(self._make_event("session.update", **self._build_session_cfg(context)))
+        await self._recv_until(ws, 'session.updated')
+        return ws
+
+    async def _take_connection(self, context: str):
+        """获取一个已就绪的连接（优先使用预热连接，否则新建）"""
+        ws = self._warm_ws
+        self._warm_ws = None
+
+        if ws is not None:
+            age = time.monotonic() - self._warm_time
+            if age < WARM_MAX_AGE and self._warm_context == context:
+                try:
+                    pong = await ws.ping()
+                    await asyncio.wait_for(pong, timeout=3)
+                    logger.info(f"使用预热连接（age={age:.1f}s）")
+                    return ws
+                except Exception:
+                    logger.info("预热连接已失效，重新建立")
+            else:
+                reason = f"age={age:.1f}s" if age >= WARM_MAX_AGE else "context 变化"
+                logger.info(f"丢弃预热连接（{reason}）")
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+        logger.info("新建 WebSocket 连接")
+        return await self._create_configured_ws(context)
+
+    async def _warm_up(self, context: str):
+        """后台预热：建立下一个连接并完成 session 配置"""
+        try:
+            if self._warm_ws is not None:
+                return
+            ws = await self._create_configured_ws(context)
+            if self._warm_ws is not None:
+                await ws.close()
+                return
+            self._warm_ws = ws
+            self._warm_context = context
+            self._warm_time = time.monotonic()
+            logger.info("预热连接就绪")
+        except Exception as e:
+            logger.warning(f"预热连接失败: {e}")
+
+    def _schedule_warm_up(self, context: str):
+        """在事件循环上调度预热任务（线程安全）"""
+        asyncio.run_coroutine_threadsafe(self._warm_up(context), self._loop)
 
     # ------------------------------------------------------------------
     # 主入口
@@ -178,61 +269,25 @@ class AliyunRecognizer:
 
     async def _run_session(self, socket_id: str, audio_queue: asyncio.Queue,
                            result_future: concurrent.futures.Future, context: str):
-        headers = {
-            "Authorization": f"bearer {self._api_key}",
-            "X-DashScope-DataInspection": "enable",
-        }
+        ws = None
         try:
-            async with websockets.connect(self._build_ws_url(), additional_headers=headers) as ws:
-                await self._recv_until(ws, 'session.created')
+            ws = await self._take_connection(context)
 
-                session_cfg = {
-                    "session": {
-                        "modalities": ["audio", "text"],
-                        "input_audio_format": "pcm",
-                        "input_audio_sample_rate": self.sample_rate,
-                        "turn_detection": None,
-                        "input_audio_transcription": {
-                            "language": self._language,
-                            "enable_itn": self._enable_itn,
-                        },
-                    }
-                }
-                if context:
-                    session_cfg["session"]["input_audio_transcription"]["context"] = context
-                await ws.send(self._make_event("session.update", **session_cfg))
-                await self._recv_until(ws, 'session.updated')
+            # 持续接收音频块并发送
+            chunk_bytes = AUDIO_CHUNK_SIZE * 2
+            while True:
+                pcm = await audio_queue.get()
+                if pcm is None:  # 结束信号
+                    break
+                offset = 0
+                while offset < len(pcm):
+                    chunk = pcm[offset:offset + chunk_bytes]
+                    b64 = base64.b64encode(chunk).decode('ascii')
+                    await ws.send(self._make_event("input_audio_buffer.append", audio=b64))
+                    offset += chunk_bytes
 
-                # 持续接收音频块并发送
-                chunk_bytes = AUDIO_CHUNK_SIZE * 2
-                while True:
-                    pcm = await audio_queue.get()
-                    if pcm is None:  # 结束信号
-                        break
-                    offset = 0
-                    while offset < len(pcm):
-                        chunk = pcm[offset:offset + chunk_bytes]
-                        b64 = base64.b64encode(chunk).decode('ascii')
-                        await ws.send(self._make_event("input_audio_buffer.append", audio=b64))
-                        offset += chunk_bytes
-
-                await ws.send(self._make_event("input_audio_buffer.commit"))
-                await ws.send(self._make_event("session.finish"))
-
-                # 收集最终结果
-                final_text = ""
-                while True:
-                    data = json.loads(await ws.recv())
-                    evt = data.get("type", "")
-                    if evt == "conversation.item.input_audio_transcription.completed":
-                        final_text = data.get("transcript", "")
-                    elif evt == "session.finished":
-                        break
-                    elif evt == "error":
-                        logger.error(f"Qwen3-ASR 服务端错误: {data}")
-                        break
-
-                result_future.set_result(final_text)
+            final_text = await self._commit_and_recv(ws)
+            result_future.set_result(final_text)
 
         except Exception as e:
             logger.error(f"Qwen3-ASR session 异常: {e}")
@@ -240,6 +295,12 @@ class AliyunRecognizer:
                 result_future.set_result("")
         finally:
             self._sessions.pop(socket_id, None)
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            self._schedule_warm_up(context)
 
     # ------------------------------------------------------------------
     # 工具方法
@@ -249,32 +310,28 @@ class AliyunRecognizer:
         """在持久事件循环上同步运行协程"""
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=30)
 
+    async def _commit_and_recv(self, ws) -> str:
+        """发送 commit+finish 并收集识别结果"""
+        await ws.send(self._make_event("input_audio_buffer.commit"))
+        await ws.send(self._make_event("session.finish"))
+
+        final_text = ""
+        while True:
+            data = json.loads(await ws.recv())
+            evt = data.get("type", "")
+            if evt == "conversation.item.input_audio_transcription.completed":
+                final_text = data.get("transcript", "")
+            elif evt == "session.finished":
+                break
+            elif evt == "error":
+                logger.error(f"Qwen3-ASR 服务端错误: {data}")
+                break
+        return final_text
+
     async def _ws_recognize_async(self, pcm_bytes: bytes, context: str) -> str:
         """批量模式：一次性发送所有音频"""
-        headers = {
-            "Authorization": f"bearer {self._api_key}",
-            "X-DashScope-DataInspection": "enable",
-        }
-        async with websockets.connect(self._build_ws_url(), additional_headers=headers) as ws:
-            await self._recv_until(ws, 'session.created')
-
-            session_cfg = {
-                "session": {
-                    "modalities": ["audio", "text"],
-                    "input_audio_format": "pcm",
-                    "input_audio_sample_rate": self.sample_rate,
-                    "turn_detection": None,
-                    "input_audio_transcription": {
-                        "language": self._language,
-                        "enable_itn": self._enable_itn,
-                    },
-                }
-            }
-            if context:
-                session_cfg["session"]["input_audio_transcription"]["context"] = context
-            await ws.send(self._make_event("session.update", **session_cfg))
-            await self._recv_until(ws, 'session.updated')
-
+        ws = await self._take_connection(context)
+        try:
             offset = 0
             chunk_bytes = AUDIO_CHUNK_SIZE * 2
             while offset < len(pcm_bytes):
@@ -283,21 +340,13 @@ class AliyunRecognizer:
                 await ws.send(self._make_event("input_audio_buffer.append", audio=b64))
                 offset += chunk_bytes
 
-            await ws.send(self._make_event("input_audio_buffer.commit"))
-            await ws.send(self._make_event("session.finish"))
-
-            final_text = ""
-            while True:
-                data = json.loads(await ws.recv())
-                evt = data.get("type", "")
-                if evt == "conversation.item.input_audio_transcription.completed":
-                    final_text = data.get("transcript", "")
-                elif evt == "session.finished":
-                    break
-                elif evt == "error":
-                    logger.error(f"Qwen3-ASR 服务端错误: {data}")
-                    break
-            return final_text
+            return await self._commit_and_recv(ws)
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            self._schedule_warm_up(context)
 
     def _fill_result(self, stream: RecognitionStream, final_text: str, audio: np.ndarray):
         chars = list(final_text.replace(' ', ''))
