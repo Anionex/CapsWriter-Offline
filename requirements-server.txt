@@ -11,7 +11,7 @@ watchdog
 pypinyin
 
 # online ASR (Qwen3-ASR WebSocket)
-websocket-client
+# websockets 已在基础依赖中
 
 # tray and image
 pystray

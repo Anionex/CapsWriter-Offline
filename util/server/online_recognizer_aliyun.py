@@ -6,6 +6,7 @@
 内部通过 WebSocket 协议调用 Qwen3-ASR 实时模型。
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
-import websocket
+import websockets
 
 from config_server import AliyunASRConfig
 
@@ -112,23 +113,20 @@ class AliyunRecognizer:
 
     def _ws_recognize(self, pcm_bytes: bytes, context: str) -> str:
         """通过 WebSocket 完成一次完整的识别流程"""
-        ws = websocket.create_connection(
-            self._build_ws_url(),
-            header=[
-                f"Authorization: bearer {self._api_key}",
-                "X-DashScope-DataInspection: enable",
-            ],
-            timeout=30,
-        )
-        try:
-            return self._ws_session(ws, pcm_bytes, context)
-        finally:
-            ws.close()
+        return asyncio.run(self._ws_recognize_async(pcm_bytes, context))
 
-    def _ws_session(self, ws, pcm_bytes: bytes, context: str) -> str:
+    async def _ws_recognize_async(self, pcm_bytes: bytes, context: str) -> str:
+        headers = {
+            "Authorization": f"bearer {self._api_key}",
+            "X-DashScope-DataInspection": "enable",
+        }
+        async with websockets.connect(self._build_ws_url(), additional_headers=headers) as ws:
+            return await self._ws_session(ws, pcm_bytes, context)
+
+    async def _ws_session(self, ws, pcm_bytes: bytes, context: str) -> str:
         """WebSocket 会话：配置 → 发送音频 → 收集结果"""
         # 1. 等待 session.created
-        self._recv_until(ws, 'session.created')
+        await self._recv_until(ws, 'session.created')
 
         # 2. 发送 session.update（手动模式，不用 VAD）
         session_cfg = {
@@ -145,8 +143,8 @@ class AliyunRecognizer:
         }
         if context:
             session_cfg["session"]["input_audio_transcription"]["context"] = context
-        ws.send(self._make_event("session.update", **session_cfg))
-        self._recv_until(ws, 'session.updated')
+        await ws.send(self._make_event("session.update", **session_cfg))
+        await self._recv_until(ws, 'session.updated')
 
         # 3. 分块发送音频
         offset = 0
@@ -154,17 +152,17 @@ class AliyunRecognizer:
         while offset < len(pcm_bytes):
             chunk = pcm_bytes[offset:offset + chunk_bytes]
             b64 = base64.b64encode(chunk).decode('ascii')
-            ws.send(self._make_event("input_audio_buffer.append", audio=b64))
+            await ws.send(self._make_event("input_audio_buffer.append", audio=b64))
             offset += chunk_bytes
 
         # 4. commit + finish
-        ws.send(self._make_event("input_audio_buffer.commit"))
-        ws.send(self._make_event("session.finish"))
+        await ws.send(self._make_event("input_audio_buffer.commit"))
+        await ws.send(self._make_event("session.finish"))
 
         # 5. 收集识别结果
         final_text = ""
         while True:
-            data = json.loads(ws.recv())
+            data = json.loads(await ws.recv())
             evt = data.get("type", "")
 
             if evt == "conversation.item.input_audio_transcription.completed":
@@ -177,10 +175,10 @@ class AliyunRecognizer:
 
         return final_text
 
-    def _recv_until(self, ws, target_type: str):
+    async def _recv_until(self, ws, target_type: str):
         """接收消息直到收到指定类型的事件"""
         while True:
-            data = json.loads(ws.recv())
+            data = json.loads(await ws.recv())
             evt = data.get("type", "")
             if evt == target_type:
                 return data
