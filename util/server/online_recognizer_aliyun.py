@@ -14,6 +14,7 @@
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ class RecognitionStream:
 @dataclass
 class _SessionState:
     audio_queue: asyncio.Queue
-    result_future: 'asyncio.Future[str]'
+    result_future: concurrent.futures.Future
     task: asyncio.Task
     ready_event: threading.Event   # WebSocket 建立并配置完成后 set
 
@@ -181,7 +182,7 @@ class AliyunRecognizer:
 
     async def _create_session(self, socket_id: str, context: str, ready_event: threading.Event):
         audio_queue: asyncio.Queue = asyncio.Queue()
-        result_future: asyncio.Future = self._loop.create_future()
+        result_future: concurrent.futures.Future = concurrent.futures.Future()
         task = self._loop.create_task(
             self._run_session(socket_id, audio_queue, result_future, ready_event, context)
         )
@@ -193,7 +194,7 @@ class AliyunRecognizer:
         )
 
     async def _run_session(self, socket_id: str, audio_queue: asyncio.Queue,
-                           result_future: 'asyncio.Future[str]',
+                           result_future: concurrent.futures.Future,
                            ready_event: threading.Event, context: str):
         headers = {
             "Authorization": f"bearer {self._api_key}",
