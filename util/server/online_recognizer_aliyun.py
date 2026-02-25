@@ -65,7 +65,6 @@ class _SessionState:
     audio_queue: asyncio.Queue
     result_future: concurrent.futures.Future
     task: asyncio.Task
-    ready_event: threading.Event   # WebSocket 建立并配置完成后 set
 
 
 class AliyunRecognizer:
@@ -128,25 +127,11 @@ class AliyunRecognizer:
 
         # ---- 流式模式 ----
         if socket_id not in self._sessions:
-            self._open_session(socket_id, ctx)
+            self._open_session(socket_id, ctx)  # 同步等待 session 对象创建完成
 
-        session = self._sessions.get(socket_id)
-        if session is None:
-            # 建立失败，退化批量
-            if is_final:
-                final_text = self._run(self._ws_recognize_async(pcm_bytes, ctx))
-                self._fill_result(stream, final_text, audio)
-            else:
-                stream.set_result("")
-            return
+        session = self._sessions[socket_id]  # 此时一定存在
 
-        # 等待 WebSocket 就绪（通常在第一个片段时等一次，后续片段无需等待）
-        if not session.ready_event.wait(timeout=10):
-            logger.error("Qwen3-ASR session 建立超时")
-            stream.set_result("")
-            return
-
-        # 发送音频
+        # 直接放入队列，_run_session 会在 WebSocket 就绪后读取（无需等待建连）
         asyncio.run_coroutine_threadsafe(
             session.audio_queue.put(pcm_bytes), self._loop
         ).result()
@@ -173,29 +158,26 @@ class AliyunRecognizer:
     # ------------------------------------------------------------------
 
     def _open_session(self, socket_id: str, context: str):
-        """在事件循环线程中启动一个新 session"""
-        ready_event = threading.Event()
+        """同步等待 session 对象创建完成（WebSocket 建连在后台异步进行）"""
         asyncio.run_coroutine_threadsafe(
-            self._create_session(socket_id, context, ready_event),
+            self._create_session(socket_id, context),
             self._loop
-        )
+        ).result()
 
-    async def _create_session(self, socket_id: str, context: str, ready_event: threading.Event):
+    async def _create_session(self, socket_id: str, context: str):
         audio_queue: asyncio.Queue = asyncio.Queue()
         result_future: concurrent.futures.Future = concurrent.futures.Future()
         task = self._loop.create_task(
-            self._run_session(socket_id, audio_queue, result_future, ready_event, context)
+            self._run_session(socket_id, audio_queue, result_future, context)
         )
         self._sessions[socket_id] = _SessionState(
             audio_queue=audio_queue,
             result_future=result_future,
             task=task,
-            ready_event=ready_event,
         )
 
     async def _run_session(self, socket_id: str, audio_queue: asyncio.Queue,
-                           result_future: concurrent.futures.Future,
-                           ready_event: threading.Event, context: str):
+                           result_future: concurrent.futures.Future, context: str):
         headers = {
             "Authorization": f"bearer {self._api_key}",
             "X-DashScope-DataInspection": "enable",
@@ -220,9 +202,6 @@ class AliyunRecognizer:
                     session_cfg["session"]["input_audio_transcription"]["context"] = context
                 await ws.send(self._make_event("session.update", **session_cfg))
                 await self._recv_until(ws, 'session.updated')
-
-                # WebSocket 就绪，通知主线程可以开始发送音频
-                ready_event.set()
 
                 # 持续接收音频块并发送
                 chunk_bytes = AUDIO_CHUNK_SIZE * 2
@@ -257,7 +236,6 @@ class AliyunRecognizer:
 
         except Exception as e:
             logger.error(f"Qwen3-ASR session 异常: {e}")
-            ready_event.set()  # 防止主线程永久阻塞
             if not result_future.done():
                 result_future.set_result("")
         finally:
