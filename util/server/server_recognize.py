@@ -128,7 +128,7 @@ def recognize(recognizer, punc_model, task: Task) -> Result:
         # 尝试带上 context 参数（自定义 FunASREngine 支持）
         # 如果是原生 sherpa-onnx 引擎，不支持 context，会抛出 TypeError，此时回退到普通调用
         try:
-            recognizer.decode_stream(stream, context=task.context)
+            recognizer.decode_stream(stream, context=task.context, is_final=task.is_final)
         except TypeError:
             recognizer.decode_stream(stream)
 

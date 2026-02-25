@@ -79,8 +79,12 @@ class AliyunRecognizer:
         msg.update(kwargs)
         return json.dumps(msg, ensure_ascii=False)
 
-    def decode_stream(self, stream: RecognitionStream, context=None, **kwargs):
-        """通过 WebSocket 实时接口调用 Qwen3-ASR 识别音频"""
+    def decode_stream(self, stream: RecognitionStream, context=None, is_final=True, **kwargs):
+        """通过 WebSocket 实时接口调用 Qwen3-ASR 识别音频（仅处理最终片段）"""
+        if not is_final:
+            stream.set_result("")
+            return
+
         audio = stream.audio_data
         if audio is None:
             stream.set_result("")
